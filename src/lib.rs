@@ -81,6 +81,145 @@
 
 // TODO: Document differences between GLFW and glfw-rs
 
+macro_rules! make_user_callback_functions {
+    (
+        doc -> $doc:literal,
+        set -> $set:ident,
+        unset -> $unset:ident,
+        poll -> $poll:ident,
+        callback_field -> $callback_field:ident,
+        poll_field -> $poll_field:ident,
+        glfw -> $glfw:ident,
+        args -> ($($args:ty),*),
+        secret -> $secret:ident
+    ) => {
+        #[doc = $doc]
+        pub fn $set<T>(&mut self, callback: T)
+        where T: FnMut(&mut Window, $($args),*) + 'static {
+            unsafe {
+                let callbacks = WindowCallbacks::get_callbacks(self.ptr);
+                callbacks.$callback_field = Some(Box::new(callback));
+                ffi::$glfw(self.ptr, Some(Self::$secret));
+            }
+        }
+
+        #[doc = $doc]
+        pub fn $unset(&mut self) {
+            unsafe {
+                let callbacks = WindowCallbacks::get_callbacks(self.ptr);
+                callbacks.$callback_field = None;
+
+                // We're removing the callback, if theres no polling either, set to null
+                if !callbacks.$poll_field {
+                    ffi::$glfw(self.ptr, None);
+                }
+            }
+        }
+
+        #[doc = $doc]
+        pub fn $poll(&mut self, should_poll: bool) {
+            unsafe {
+                let callbacks = WindowCallbacks::get_callbacks(self.ptr);
+                callbacks.$poll_field = should_poll;
+
+                // If no polling and not custom callback, set glfw callback to null
+                if should_poll {
+                    ffi::$glfw(self.ptr, Some(Self::$secret));
+                } else if callbacks.$callback_field.is_none() {
+                    ffi::$glfw(self.ptr, None);
+                }
+            }
+        }
+    }
+}
+
+macro_rules! new_callback {
+    (
+        doc -> $doc:literal,
+        set -> $set:ident,
+        unset -> $unset:ident,
+        poll -> $poll:ident,
+        callback_field -> $callback_field:ident,
+        poll_field -> $poll_field:ident,
+        window_event -> $window_event:ident ($($args:ty),+),
+        glfw -> $glfw:ident ($($glfw_arg_names:ident: $glfw_args:ty),*),
+        convert_args -> ($($convert_args:expr),*),
+        secret -> $secret:ident
+    ) => {
+
+        #[allow(unused_unsafe)]
+        extern "C" fn $secret(glfw_window: *mut GLFWwindow, $($glfw_arg_names: $glfw_args),*) {
+            unsafe {
+                let callbacks = WindowCallbacks::get_callbacks(glfw_window);
+                let window = &mut *callbacks.window_ptr;
+                if let Some(func) = &mut callbacks.$callback_field {
+                    func(window, $($convert_args),*);
+                }
+                if callbacks.$poll_field {
+                    let event = (ffi::glfwGetTime() as f64, WindowEvent::$window_event($($convert_args),*));
+                    if let Some(event) = callbacks::unbuffered::handle(glfw_window as WindowId, event) {
+                        callbacks.sender.send(event).unwrap();
+                    }
+                }
+            }
+        }
+
+        make_user_callback_functions!(
+            doc -> $doc,
+            set -> $set,
+            unset -> $unset,
+            poll -> $poll,
+            callback_field -> $callback_field,
+            poll_field -> $poll_field,
+            glfw -> $glfw,
+            args -> ($($args),*),
+            secret -> $secret
+        );
+    };
+    (
+        doc -> $doc:literal,
+        set -> $set:ident,
+        unset -> $unset:ident,
+        poll -> $poll:ident,
+        callback_field -> $callback_field:ident,
+        poll_field -> $poll_field:ident,
+        window_event -> $window_event:ident,
+        glfw -> $glfw:ident ($($glfw_arg_names:ident: $glfw_args:ty),*),
+        convert_args -> ($($convert_args:expr),*),
+        secret -> $secret:ident
+    ) => {
+
+        #[allow(unused_unsafe)]
+        extern "C" fn $secret(glfw_window: *mut GLFWwindow, $($glfw_arg_names: $glfw_args),*) {
+            unsafe {
+                let callbacks = WindowCallbacks::get_callbacks(glfw_window);
+                let window = &mut *callbacks.window_ptr;
+                if let Some(func) = &mut callbacks.$callback_field {
+                    func(window);
+                }
+                if callbacks.$poll_field {
+                    let event = (ffi::glfwGetTime() as f64, WindowEvent::$window_event);
+                    if let Some(event) = callbacks::unbuffered::handle(glfw_window as WindowId, event) {
+                        callbacks.sender.send(event).unwrap();
+                    }
+                }
+            }
+        }
+
+        make_user_callback_functions!(
+            doc -> $doc,
+            set -> $set,
+            unset -> $unset,
+            poll -> $poll,
+            callback_field -> $callback_field,
+            poll_field -> $poll_field,
+            glfw -> $glfw,
+            args -> (),
+            secret -> $secret
+        );
+    }
+}
+
 #[cfg(feature = "log")]
 #[macro_use]
 extern crate log;
@@ -97,7 +236,7 @@ use raw_window_handle::{HasRawWindowHandle, RawWindowHandle, HasRawDisplayHandle
 use std::error;
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::marker::Send;
+use std::marker::{PhantomPinned, Send};
 use std::mem;
 #[cfg(feature = "vulkan")]
 use std::os::raw::c_uint;
@@ -110,9 +249,13 @@ use std::ptr;
 use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::ffi::*;
+use std::pin::Pin;
+use std::ptr::{null, null_mut};
 
 #[cfg(feature = "vulkan")]
 use ash::vk;
+use crate::ffi::GLFWwindow;
 
 /// Alias to `MouseButton1`, supplied for improved clarity.
 pub use self::MouseButton::Button1 as MouseButtonLeft;
@@ -387,12 +530,6 @@ impl fmt::Debug for DebugAliases<MouseButton> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct Callback<Fn, UserData> {
-    pub f: Fn,
-    pub data: UserData,
-}
-
 /// Tokens corresponding to various error types.
 #[repr(i32)]
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
@@ -432,39 +569,43 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
-/// An error callback. This can be supplied with some user data to be passed to
-/// the callback function when it is triggered.
-pub type ErrorCallback<UserData> = Callback<fn(Error, String, &UserData), UserData>;
-
-/// The function to be used with the `FAIL_ON_ERRORS` callback.
-pub fn fail_on_errors(_: Error, description: String, _: &()) {
+/// The function to be used with the `fail_on_errors!()` callback.
+pub fn fail_on_errors(_: Error, description: String) {
     panic!("GLFW Error: {}", description);
 }
 
 /// A callback that triggers a task failure when an error is encountered.
-pub static FAIL_ON_ERRORS: Option<ErrorCallback<()>> = Some(Callback {
-    f: fail_on_errors as fn(Error, String, &()),
-    data: (),
-});
+#[macro_export]
+macro_rules! fail_on_errors {
+    () => {{
+        |error, description| {
+            fail_on_errors(error, description);
+        }
+    }}
+}
 
 #[cfg(feature = "log")]
 /// The function to be used with the `LOG_ERRORS` callback.
-pub fn log_errors(_: Error, description: String, _: &()) {
+pub fn log_errors(_: Error, description: String) {
     error!("GLFW Error: {}", description);
 }
 
 #[cfg(not(feature = "log"))]
 /// The function to be used with the `LOG_ERRORS` callback.
-pub fn log_errors(_: Error, description: String, _: &()) {
+pub fn log_errors(_: Error, description: String) {
     eprintln!("GLFW Error: {}", description);
 }
 
 /// A callback that logs each error as it is encountered without triggering a
-/// task failure.
-pub static LOG_ERRORS: Option<ErrorCallback<()>> = Some(Callback {
-    f: log_errors as fn(Error, String, &()),
-    data: (),
-});
+/// task failure
+#[macro_export]
+macro_rules! log_errors {
+    () => {{
+        |error, description| {
+            log_errors(error, description);
+        }
+    }}
+}
 
 /// When not using the `image` library, or if you just want to,
 /// you can specify an image from its raw pixel data using this structure.
@@ -653,6 +794,89 @@ pub type VkProc = ffi::GLFWvkproc;
 /// It uses for "global" refference counting for Glfw.
 static REF_COUNT_FOR_GLFW: AtomicUsize = AtomicUsize::new(0);
 
+/// A struct that represents a thread safe handle to a `Glfw`
+#[derive(Debug)]
+pub struct ThreadSafeGlfw {
+    glfw: Glfw
+}
+
+impl ThreadSafeGlfw {
+
+    /// Creates a new `Glfw` wrapper that can be shared between threads
+    pub fn from(glfw: &mut Glfw) -> Self {
+        Self {
+            glfw: glfw.clone()
+        }
+    }
+
+    /// Wrapper function, please refer to [`Glfw::set_swap_interval`]
+    pub fn set_swap_interval(&mut self, interval: SwapInterval) {
+        self.glfw.set_swap_interval(interval);
+    }
+
+    /// Wrapper function, please refer to [`Glfw::extension_supported`]
+    pub fn extension_supported(&self, extension: &str) -> bool {
+        self.glfw.extension_supported(extension)
+    }
+
+    /// Wrapper function, please refer to [`Glfw::get_time`]
+    pub fn get_time(&self) -> f64 {
+        self.glfw.get_time()
+    }
+
+    /// Wrapper function, please refer to [`Glfw::set_time`]
+    pub fn set_time(&mut self, time: f64) {
+        self.glfw.set_time(time);
+    }
+
+    /// Wrapper function, please refer to [`Glfw::vulkan_supported`]
+    #[cfg(feature = "vulkan")]
+    pub fn vulkan_supported(&self) -> bool {
+        self.glfw.vulkan_supported()
+    }
+
+    /// Wrapper function, please refer to [`Glfw::get_required_instance_extensions`]
+    #[cfg(feature = "vulkan")]
+    pub fn get_required_instance_extensions(&self) -> Option<Vec<String>> {
+        self.glfw.get_required_instance_extensions()
+    }
+
+    /// Wrapper function, please refer to [`Glfw::get_instance_proc_address_raw`]
+    #[cfg(feature = "vulkan")]
+    pub fn get_instance_proc_address_raw(&self, instance: vk::Instance, procname: &str) -> VkProc {
+        self.glfw.get_instance_proc_address_raw(instance, procname)
+    }
+
+    /// Wrapper function, please refer to [`Glfw::get_physical_device_presentation_support_raw`]
+    #[cfg(feature = "vulkan")]
+    pub fn get_physical_device_presentation_support_raw(
+        &self,
+        instance: vk::Instance,
+        device: vk::PhysicalDevice,
+        queue_family: u32,
+    ) -> bool {
+        self.glfw.get_physical_device_presentation_support_raw(instance, device, queue_family)
+    }
+
+    /// Wrapper function, please refer to [`Glfw::get_timer_value`]
+    pub fn get_timer_value(&self) -> u64 {
+        self.glfw.get_timer_value()
+    }
+
+    /// Wrapper function, please refer to [`Glfw::get_timer_frequency`]
+    pub fn get_timer_frequency(&self) -> u64 {
+        self.glfw.get_timer_frequency()
+    }
+
+    /// Wrapper function, please refer to [`Glfw::post_empty_event`]
+    pub fn post_empty_event(&self) {
+        self.glfw.post_empty_event()
+    }
+
+}
+
+unsafe impl Send for ThreadSafeGlfw {}
+
 /// A token from which to call various GLFW functions. It can be obtained by
 /// calling the `init` function. This cannot be sent to other tasks, and should
 /// only be initialized on the main platform thread. Whilst this might make
@@ -753,16 +977,20 @@ pub fn init_hint(hint: InitHint) {
 /// - Subsequent calls to `init` will return `Glfw` token immediately.
 /// - If an initialization error occurred within the GLFW library
 ///   `Err(InternalInitError)` will be returned.
-pub fn init<UserData: 'static>(
-    mut callback: Option<ErrorCallback<UserData>>,
-) -> Result<Glfw, InitError> {
-    // Initialize the error callback if it was supplied. This is done
+pub fn init<T>(callback: T)
+               -> Result<Glfw, InitError>
+    where T: FnMut(Error, String) + 'static
+{
+    // Initialize the error callback. This is done
     // before `ffi::glfwInit` because errors could occur during
     // initialization.
-    match callback.take() {
-        Some(f) => callbacks::error::set(f),
-        None => callbacks::error::unset(),
-    }
+    callbacks::error::set(callback);
+
+    init_no_callbacks()
+}
+
+pub fn init_no_callbacks() -> Result<Glfw, InitError>
+{
     // initialize GLFW.
     // FYI: multiple not terminated ffi::glfwInit() returns ffi::TRUE immediately.
     // https://www.glfw.org/docs/latest/group__init.html#ga317aac130a235ab08c6db0834907d85e
@@ -780,62 +1008,76 @@ impl Glfw {
     /// # Example
     ///
     /// ~~~ignore
-    /// use std::cell::Cell;
-    ///
-    /// fn error_callback(_: glfw::Error, description: String, error_count: &Cell<usize>) {
-    ///     println!("GLFW error {}: {}", error_count.get(), description);
-    ///     error_count.set(error_count.get() + 1);
-    /// }
-    ///
     /// // sets a new callback
-    /// glfw.set_error_callback(Some(
-    ///     glfw::Callback {
-    ///         f: error_callback,
-    ///         data: Cell::new(0),
-    ///     }
-    /// ));
+    ///
+    /// let mut error_count: usize = 0;
+    /// glfw.set_error_callback(Some(move |error, description| {
+    ///     println!("GLFW error {}: {}", error_count, description);
+    ///     error_count += 1;
+    /// }));
     ///
     /// // removes the previously set callback
     /// glfw.set_error_callback(None);
     /// ~~~
     ///
-    /// The `FAIL_ON_ERRORS` and `LOG_ERRORS` callbacks are provided for
+    /// The `fail_on_errors!()` and `log_errors!()` callback macros are provided for
     /// convenience. For example:
     ///
     /// ~~~ignore
     /// // triggers a task failure when a GLFW error is encountered.
-    /// glfw.set_error_callback(glfw::FAIL_ON_ERRORS);
+    /// glfw.set_error_callback(fail_on_errors!());
     /// ~~~
-    pub fn set_error_callback<UserData: 'static>(
+    pub fn set_error_callback<T>(
         &mut self,
-        callback: Option<ErrorCallback<UserData>>,
-    ) {
-        match callback {
-            Some(f) => callbacks::error::set(f),
-            None => callbacks::error::unset(),
-        }
+        callback: T,
+    )
+        where T: FnMut(Error, String) + 'static
+    {
+        callbacks::error::set(callback);
+    }
+
+    /// Unsets the monitor callback
+    pub fn unset_error_callback(
+        &mut self,
+    )
+    {
+        callbacks::error::unset();
     }
 
     /// Sets the monitor callback, overwriting the previous one stored.
-    pub fn set_monitor_callback<UserData: 'static>(
+    pub fn set_monitor_callback<T>(
         &mut self,
-        callback: Option<MonitorCallback<UserData>>,
-    ) {
-        match callback {
-            Some(f) => callbacks::monitor::set(f),
-            None => callbacks::monitor::unset(),
-        }
+        callback: T
+    )
+        where T: FnMut(Monitor, MonitorEvent) + 'static
+    {
+        callbacks::monitor::set(callback);
+    }
+
+    /// Unsets the monitor callback
+    pub fn unset_monitor_callback(
+        &mut self,
+    )
+    {
+        callbacks::monitor::unset();
     }
 
     /// Sets the joystick callback, overwriting the previous one stored
-    pub fn set_joystick_callback<UserData: 'static>(
+    pub fn set_joystick_callback<T>(
         &mut self,
-        callback: Option<JoystickCallback<UserData>>,
-    ) {
-        match callback {
-            Some(f) => callbacks::joystick::set(f),
-            None => callbacks::joystick::unset(),
-        }
+        callback: T,
+    )
+        where T: FnMut(JoystickId, JoystickEvent) + 'static
+    {
+        callbacks::joystick::set(callback);
+    }
+
+    /// Unsets the joystick callback
+    pub fn unset_joystick_callback(
+        &mut self,
+    )
+    {
+        callbacks::joystick::unset();
     }
 
     /// Supplies the primary monitor to the closure provided, if it exists.
@@ -852,11 +1094,11 @@ impl Glfw {
     /// ~~~
     pub fn with_primary_monitor<T, F>(&mut self, f: F) -> T
     where
-        F: FnOnce(&mut Self, Option<&Monitor>) -> T,
+        F: FnOnce(&mut Self, Option<&mut Monitor>) -> T,
     {
         match unsafe { ffi::glfwGetPrimaryMonitor() } {
             ptr if ptr.is_null() => f(self, None),
-            ptr => f(self, Some(&Monitor { ptr })),
+            ptr => f(self, Some(&mut Monitor { ptr })),
         }
     }
 
@@ -874,14 +1116,14 @@ impl Glfw {
     /// ~~~
     pub fn with_connected_monitors<T, F>(&mut self, f: F) -> T
     where
-        F: FnOnce(&mut Self, &[Monitor]) -> T,
+        F: FnOnce(&mut Self, &mut [Monitor]) -> T,
     {
         unsafe {
             let mut count = 0;
             let ptr = ffi::glfwGetMonitors(&mut count);
             f(
                 self,
-                &slice::from_raw_parts(ptr as *const _, count as usize)
+                &mut slice::from_raw_parts(ptr as *const _, count as usize)
                     .iter()
                     .map(|&ptr| Monitor { ptr })
                     .collect::<Vec<Monitor>>(),
@@ -1078,7 +1320,7 @@ impl Glfw {
         height: u32,
         title: &str,
         mode: WindowMode<'_>,
-    ) -> Option<(Window, Receiver<(f64, WindowEvent)>)> {
+    ) -> Option<(Pin<Box<Window>>, Receiver<(f64, WindowEvent)>)> {
         #[cfg(feature = "wayland")]
         {
             // Has to be set otherwise wayland refuses to open window.
@@ -1095,7 +1337,7 @@ impl Glfw {
         title: &str,
         mode: WindowMode<'_>,
         share: Option<&Window>,
-    ) -> Option<(Window, Receiver<(f64, WindowEvent)>)> {
+    ) -> Option<(Pin<Box<Window>>, Receiver<(f64, WindowEvent)>)> {
         let ptr = unsafe {
             with_c_str(title, |title| {
                 ffi::glfwCreateWindow(
@@ -1115,20 +1357,23 @@ impl Glfw {
         } else {
             let (drop_sender, drop_receiver) = channel();
             let (sender, receiver) = channel();
+            let window = Box::pin(Window {
+                ptr,
+                glfw: self.clone(),
+                is_shared: share.is_some(),
+                drop_sender: Some(drop_sender),
+                drop_receiver,
+                current_cursor: None,
+                phantom_pinned: PhantomPinned {}
+            });
+            let mut callbacks = Box::new(WindowCallbacks::new(sender));
+
             unsafe {
-                ffi::glfwSetWindowUserPointer(ptr, mem::transmute(Box::new(sender)));
+                callbacks.window_ptr = mem::transmute(&*window);
+                ffi::glfwSetWindowUserPointer(ptr, mem::transmute(callbacks));
             }
-            Some((
-                Window {
-                    ptr,
-                    glfw: self.clone(),
-                    is_shared: share.is_some(),
-                    drop_sender: Some(drop_sender),
-                    drop_receiver,
-                    current_cursor: None,
-                },
-                receiver,
-            ))
+
+            Some((window, receiver))
         }
     }
 
@@ -1230,7 +1475,7 @@ impl Glfw {
     /// If no windows exist, this function returns immediately.
     ///
     /// Wrapper for `glfwPostEmptyEvent`.
-    pub fn post_empty_event() {
+    pub fn post_empty_event(&self) {
         unsafe {
             ffi::glfwPostEmptyEvent();
         }
@@ -1255,12 +1500,12 @@ impl Glfw {
     }
 
     /// Wrapper for `glfwGetTimerValue`.
-    pub fn get_timer_value() -> u64 {
+    pub fn get_timer_value(&self) -> u64 {
         unsafe { ffi::glfwGetTimerValue() as u64 }
     }
 
     /// Wrapper for `glfwGetTimerFrequency`
-    pub fn get_timer_frequency() -> u64 {
+    pub fn get_timer_frequency(&self) -> u64 {
         unsafe { ffi::glfwGetTimerFrequency() as u64 }
     }
 
@@ -1420,6 +1665,113 @@ impl Drop for Glfw {
     }
 }
 
+struct WindowCallbacks {
+    window_ptr: *mut Window,
+    sender: Sender<(f64, WindowEvent)>,
+    pos_callback: Option<Box<dyn FnMut(&mut Window, i32, i32)>>,
+    size_callback: Option<Box<dyn FnMut(&mut Window, i32, i32)>>,
+    close_callback: Option<Box<dyn FnMut(&mut Window)>>,
+    refresh_callback: Option<Box<dyn FnMut(&mut Window)>>,
+    focus_callback: Option<Box<dyn FnMut(&mut Window, bool)>>,
+    iconify_callback: Option<Box<dyn FnMut(&mut Window, bool)>>,
+    framebuffer_size_callback: Option<Box<dyn FnMut(&mut Window, i32, i32)>>,
+    key_callback: Option<Box<dyn FnMut(&mut Window, Key, Scancode, Action, Modifiers)>>,
+    char_callback: Option<Box<dyn FnMut(&mut Window, char)>>,
+    char_mods_callback: Option<Box<dyn FnMut(&mut Window, char, Modifiers)>>,
+    mouse_button_callback: Option<Box<dyn FnMut(&mut Window, MouseButton, Action, Modifiers)>>,
+    cursor_pos_callback: Option<Box<dyn FnMut(&mut Window, f64, f64)>>,
+    cursor_enter_callback: Option<Box<dyn FnMut(&mut Window, bool)>>,
+    scroll_callback: Option<Box<dyn FnMut(&mut Window, f64, f64)>>,
+    drag_and_drop_callback: Option<Box<dyn FnMut(&mut Window, Vec<PathBuf>)>>,
+    maximize_callback: Option<Box<dyn FnMut(&mut Window, bool)>>,
+    content_scale_callback: Option<Box<dyn FnMut(&mut Window, f32, f32)>>,
+    pos_polling: bool,
+    size_polling: bool,
+    close_polling: bool,
+    refresh_polling: bool,
+    focus_polling: bool,
+    iconify_polling: bool,
+    framebuffer_size_polling: bool,
+    key_polling: bool,
+    char_polling: bool,
+    char_mods_polling: bool,
+    mouse_button_polling: bool,
+    cursor_pos_polling: bool,
+    cursor_enter_polling: bool,
+    scroll_polling: bool,
+    drag_and_drop_polling: bool,
+    maximize_polling: bool,
+    content_scale_polling: bool
+}
+
+impl WindowCallbacks {
+
+    fn new(receiver: Sender<(f64, WindowEvent)>) -> Self {
+        Self {
+            window_ptr: null_mut(),
+            sender: receiver,
+            pos_callback: None,
+            size_callback: None,
+            close_callback: None,
+            refresh_callback: None,
+            focus_callback: None,
+            iconify_callback: None,
+            framebuffer_size_callback: None,
+            key_callback: None,
+            char_callback: None,
+            char_mods_callback: None,
+            mouse_button_callback: None,
+            cursor_pos_callback: None,
+            cursor_enter_callback: None,
+            scroll_callback: None,
+            drag_and_drop_callback: None,
+            maximize_callback: None,
+            content_scale_callback: None,
+            pos_polling: false,
+            size_polling: false,
+            close_polling: false,
+            refresh_polling: false,
+            focus_polling: false,
+            iconify_polling: false,
+            framebuffer_size_polling: false,
+            key_polling: false,
+            char_polling: false,
+            char_mods_polling: false,
+            mouse_button_polling: false,
+            cursor_pos_polling: false,
+            cursor_enter_polling: false,
+            scroll_polling: false,
+            drag_and_drop_polling: false,
+            maximize_polling: false,
+            content_scale_polling: false
+        }
+    }
+
+    fn get_callbacks<'a>(window: *mut GLFWwindow) -> &'a mut WindowCallbacks {
+        unsafe {
+            &mut *(ffi::glfwGetWindowUserPointer(window) as *mut WindowCallbacks)
+        }
+    }
+}
+
+/// Wrapper for `glfwGetError`.
+pub fn get_error() -> Error {
+    unsafe {
+        mem::transmute(ffi::glfwGetError(null_mut()))
+    }
+}
+
+/// Wrapper for `glfwGetError`.
+pub fn get_error_string() -> (Error, String) {
+    unsafe {
+        let mut description: *const c_char = null();
+        let error: Error = mem::transmute(ffi::glfwGetError(&mut description));
+        (error, string_from_c_str(description))
+    }
+}
+
+
+
 /// Wrapper for `glfwGetVersion`.
 pub fn get_version() -> Version {
     unsafe {
@@ -1462,10 +1814,6 @@ where
 pub fn get_version_string() -> String {
     unsafe { string_from_c_str(ffi::glfwGetVersionString()) }
 }
-
-/// An monitor callback. This can be supplied with some user data to be passed
-/// to the callback function when it is triggered.
-pub type MonitorCallback<UserData> = Callback<fn(Monitor, MonitorEvent, &UserData), UserData>;
 
 /// A struct that wraps a `*GLFWmonitor` handle.
 #[allow(missing_copy_implementations)]
@@ -1969,20 +2317,8 @@ pub struct Window {
     /// of forcing the user to take care of its lifetime.
     current_cursor: Option<Cursor>,
     pub glfw: Glfw,
-}
-
-macro_rules! set_window_callback {
-    ($window:ident, $should_poll:expr, $ll_fn:ident, $callback:ident) => {{
-        if $should_poll {
-            unsafe {
-                ffi::$ll_fn($window.ptr, Some(callbacks::$callback));
-            }
-        } else {
-            unsafe {
-                ffi::$ll_fn($window.ptr, None);
-            }
-        }
-    }};
+    #[allow(unused)]
+    phantom_pinned: PhantomPinned
 }
 
 impl Window {
@@ -2048,7 +2384,7 @@ impl Window {
         height: u32,
         title: &str,
         mode: WindowMode<'_>,
-    ) -> Option<(Window, Receiver<(f64, WindowEvent)>)> {
+    ) -> Option<(Pin<Box<Window>>, Receiver<(f64, WindowEvent)>)> {
         self.glfw
             .create_window_intern(width, height, title, mode, Some(self))
     }
@@ -2062,6 +2398,7 @@ impl Window {
     pub fn render_context(&mut self) -> RenderContext {
         RenderContext {
             ptr: self.ptr,
+            glfw: self.glfw.clone(),
             // this will only be None after dropping so this is safe
             drop_sender: self.drop_sender.as_ref().unwrap().clone(),
         }
@@ -2394,15 +2731,247 @@ impl Window {
         unsafe { ffi::glfwGetWindowAttrib(self.ptr, ffi::HOVERED) == ffi::TRUE }
     }
 
-    /// Wrapper for `glfwSetWindowPosCallback`.
-    pub fn set_pos_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowPosCallback,
-            window_pos_callback
-        );
-    }
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowPosCallback`.",
+        set -> set_pos_callback,
+        unset -> unset_pos_callback,
+        poll -> set_pos_polling,
+        callback_field -> pos_callback,
+        poll_field -> pos_polling,
+        window_event -> Pos(i32, i32),
+        glfw -> glfwSetWindowPosCallback(x: c_int, y: c_int),
+        convert_args -> (x as i32, y as i32),
+        secret -> _pos_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowSizeCallback`.",
+        set -> set_size_callback,
+        unset -> unset_size_callback,
+        poll -> set_size_polling,
+        callback_field -> size_callback,
+        poll_field -> size_polling,
+        window_event -> Size(i32, i32),
+        glfw -> glfwSetWindowSizeCallback(width: c_int, height: c_int),
+        convert_args -> (width as i32, height as i32),
+        secret -> _size_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowCloseCallback`.",
+        set -> set_close_callback,
+        unset -> unset_close_callback,
+        poll -> set_close_polling,
+        callback_field -> close_callback,
+        poll_field -> close_polling,
+        window_event -> Close,
+        glfw -> glfwSetWindowCloseCallback(),
+        convert_args -> (),
+        secret -> _close_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowRefreshCallback`.",
+        set -> set_refresh_callback,
+        unset -> unset_refresh_callback,
+        poll -> set_refresh_polling,
+        callback_field -> refresh_callback,
+        poll_field -> refresh_polling,
+        window_event -> Refresh,
+        glfw -> glfwSetWindowRefreshCallback(),
+        convert_args -> (),
+        secret -> _refresh_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowFocusCallback`.",
+        set -> set_focus_callback,
+        unset -> unset_focus_callback,
+        poll -> set_focus_polling,
+        callback_field -> focus_callback,
+        poll_field -> focus_polling,
+        window_event -> Focus(bool),
+        glfw -> glfwSetWindowFocusCallback(focused: c_int),
+        convert_args -> (focused == ffi::TRUE),
+        secret -> _focus_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowIconifyCallback`.",
+        set -> set_iconify_callback,
+        unset -> unset_iconify_callback,
+        poll -> set_iconify_polling,
+        callback_field -> iconify_callback,
+        poll_field -> iconify_polling,
+        window_event -> Iconify(bool),
+        glfw -> glfwSetWindowIconifyCallback(iconified: c_int),
+        convert_args -> (iconified == ffi::TRUE),
+        secret -> _iconify_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetFramebufferSizeCallback`.",
+        set -> set_framebuffer_size_callback,
+        unset -> unset_framebuffer_size_callback,
+        poll -> set_framebuffer_size_polling,
+        callback_field -> framebuffer_size_callback,
+        poll_field -> framebuffer_size_polling,
+        window_event -> FramebufferSize(i32, i32),
+        glfw -> glfwSetFramebufferSizeCallback(width: c_int, height: c_int),
+        convert_args -> (width as i32, height as i32),
+        secret -> _framebuffer_size_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetKeyCallback`.",
+        set -> set_key_callback,
+        unset -> unset_key_callback,
+        poll -> set_key_polling,
+        callback_field -> key_callback,
+        poll_field -> key_polling,
+        window_event -> Key(Key, Scancode, Action, Modifiers),
+        glfw -> glfwSetKeyCallback(key: c_int, scancode: c_int, action: c_int, mods: c_int),
+        convert_args -> (
+            mem::transmute(key),
+            scancode, mem::transmute(action),
+            Modifiers::from_bits(mods).unwrap()
+        ),
+        secret -> _key_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetCharCallback`.",
+        set -> set_char_callback,
+        unset -> unset_char_callback,
+        poll -> set_char_polling,
+        callback_field -> char_callback,
+        poll_field -> char_polling,
+        window_event -> Char(char),
+        glfw -> glfwSetCharCallback(character: c_uint),
+        convert_args -> (::std::char::from_u32(character).unwrap()),
+        secret -> _char_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetCharModsCallback`.",
+        set -> set_char_mods_callback,
+        unset -> unset_char_mods_callback,
+        poll -> set_char_mods_polling,
+        callback_field -> char_mods_callback,
+        poll_field -> char_mods_polling,
+        window_event -> CharModifiers(char, Modifiers),
+        glfw -> glfwSetCharModsCallback(character: c_uint, mods: c_int),
+        convert_args -> (
+            ::std::char::from_u32(character).unwrap(),
+            Modifiers::from_bits(mods).unwrap()
+        ),
+        secret -> _char_mods_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetMouseButtonCallback`.",
+        set -> set_mouse_button_callback,
+        unset -> unset_mouse_button_callback,
+        poll -> set_mouse_button_polling,
+        callback_field -> mouse_button_callback,
+        poll_field -> mouse_button_polling,
+        window_event -> MouseButton(MouseButton, Action, Modifiers),
+        glfw -> glfwSetMouseButtonCallback(button: c_int, action: c_int, mods: c_int),
+        convert_args -> (
+            mem::transmute(button),
+            mem::transmute(action),
+            Modifiers::from_bits(mods).unwrap()
+        ),
+        secret -> _mouse_button_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetCursorPosCallback`.",
+        set -> set_cursor_pos_callback,
+        unset -> unset_cursor_pos_callback,
+        poll -> set_cursor_pos_polling,
+        callback_field -> cursor_pos_callback,
+        poll_field -> cursor_pos_polling,
+        window_event -> CursorPos(f64, f64),
+        glfw -> glfwSetCursorPosCallback(x: c_double, y: c_double),
+        convert_args -> (x as f64, y as f64),
+        secret -> _cursor_pos_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetCursorEnterCallback`.",
+        set -> set_cursor_enter_callback,
+        unset -> unset_cursor_enter_callback,
+        poll -> set_cursor_enter_polling,
+        callback_field -> cursor_enter_callback,
+        poll_field -> cursor_enter_polling,
+        window_event -> CursorEnter(bool),
+        glfw -> glfwSetCursorEnterCallback(entered: c_int),
+        convert_args -> (entered == ffi::TRUE),
+        secret -> _cursor_enter_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetScrollCallback`.",
+        set -> set_scroll_callback,
+        unset -> unset_scroll_callback,
+        poll -> set_scroll_polling,
+        callback_field -> scroll_callback,
+        poll_field -> scroll_polling,
+        window_event -> Scroll(f64, f64),
+        glfw -> glfwSetScrollCallback(x: c_double, y: c_double),
+        convert_args -> (x as f64, y as f64),
+        secret -> _scroll_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetDropCallback`.",
+        set -> set_drag_and_drop_callback,
+        unset -> unset_drag_and_drop_callback,
+        poll -> set_drag_and_drop_polling,
+        callback_field -> drag_and_drop_callback,
+        poll_field -> drag_and_drop_polling,
+        window_event -> FileDrop(Vec<PathBuf>),
+        glfw -> glfwSetDropCallback(num_paths: c_int, paths: *mut *const c_char),
+        convert_args -> ({
+            slice::from_raw_parts(paths, num_paths as usize)
+            .iter()
+            .map(|path| PathBuf::from(std::str::from_utf8({
+                CStr::from_ptr(*path)
+                    .to_bytes()
+            })
+            .unwrap()
+            .to_string()))
+            .collect()
+        }),
+        secret -> _drag_and_drop_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowMaximizeCallback`.",
+        set -> set_maximize_callback,
+        unset -> unset_maximize_callback,
+        poll -> set_maximize_polling,
+        callback_field -> maximize_callback,
+        poll_field -> maximize_polling,
+        window_event -> Maximize(bool),
+        glfw -> glfwSetWindowMaximizeCallback(maximized: c_int),
+        convert_args -> (maximized == ffi::TRUE),
+        secret -> _maximize_callback
+    );
+
+    new_callback!(
+        doc -> "Wrapper for `glfwSetWindowContentScaleCallback`.",
+        set -> set_content_scale_callback,
+        unset -> unset_content_scale_callback,
+        poll -> set_content_scale_polling,
+        callback_field -> content_scale_callback,
+        poll_field -> content_scale_polling,
+        window_event -> ContentScale(f32, f32),
+        glfw -> glfwSetWindowContentScaleCallback(xscale: c_float, yscale: c_float),
+        convert_args -> (xscale as f32, yscale as f32),
+        secret -> _content_scale_callback
+    );
 
     /// Starts or stops polling for all available events
     pub fn set_all_polling(&mut self, should_poll: bool) {
@@ -2423,91 +2992,6 @@ impl Window {
         self.set_drag_and_drop_polling(should_poll);
         self.set_maximize_polling(should_poll);
         self.set_content_scale_polling(should_poll);
-    }
-
-    /// Wrapper for `glfwSetWindowSizeCallback`.
-    pub fn set_size_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowSizeCallback,
-            window_size_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetWindowCloseCallback`.
-    pub fn set_close_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowCloseCallback,
-            window_close_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetWindowRefreshCallback`.
-    pub fn set_refresh_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowRefreshCallback,
-            window_refresh_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetWindowFocusCallback`.
-    pub fn set_focus_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowFocusCallback,
-            window_focus_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetWindowIconifyCallback`.
-    pub fn set_iconify_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowIconifyCallback,
-            window_iconify_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetFramebufferSizeCallback`.
-    pub fn set_framebuffer_size_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetFramebufferSizeCallback,
-            framebuffer_size_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetDropCallback`.
-    pub fn set_drag_and_drop_polling(&mut self, should_poll: bool) {
-        set_window_callback!(self, should_poll, glfwSetDropCallback, drop_callback);
-    }
-
-    /// Wrapper for `glfwSetWindowMaximizeCallback`.
-    pub fn set_maximize_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowMaximizeCallback,
-            window_maximize_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetWindowContentScaleCallback`.
-    pub fn set_content_scale_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetWindowContentScaleCallback,
-            window_content_scale_callback
-        );
     }
 
     /// Wrapper for `glfwGetInputMode` called with `CURSOR`.
@@ -2682,61 +3166,6 @@ impl Window {
         }
     }
 
-    /// Wrapper for `glfwSetKeyCallback`.
-    pub fn set_key_polling(&mut self, should_poll: bool) {
-        set_window_callback!(self, should_poll, glfwSetKeyCallback, key_callback);
-    }
-
-    /// Wrapper for `glfwSetCharCallback`.
-    pub fn set_char_polling(&mut self, should_poll: bool) {
-        set_window_callback!(self, should_poll, glfwSetCharCallback, char_callback);
-    }
-
-    /// Wrapper for `glfwSetCharModsCallback`
-    pub fn set_char_mods_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetCharModsCallback,
-            char_mods_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetMouseButtonCallback`.
-    pub fn set_mouse_button_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetMouseButtonCallback,
-            mouse_button_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetCursorPosCallback`.
-    pub fn set_cursor_pos_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetCursorPosCallback,
-            cursor_pos_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetCursorEnterCallback`.
-    pub fn set_cursor_enter_polling(&mut self, should_poll: bool) {
-        set_window_callback!(
-            self,
-            should_poll,
-            glfwSetCursorEnterCallback,
-            cursor_enter_callback
-        );
-    }
-
-    /// Wrapper for `glfwSetScrollCallback`.
-    pub fn set_scroll_polling(&mut self, should_poll: bool) {
-        set_window_callback!(self, should_poll, glfwSetScrollCallback, scroll_callback);
-    }
-
     /// Wrapper for `glfwGetClipboardString`.
     pub fn set_clipboard_string(&mut self, string: &str) {
         unsafe {
@@ -2838,7 +3267,7 @@ impl Drop for Window {
 
         if !self.ptr.is_null() {
             unsafe {
-                let _: Box<Sender<(f64, WindowEvent)>> =
+                let _: Box<WindowCallbacks> =
                     mem::transmute(ffi::glfwGetWindowUserPointer(self.ptr));
             }
         }
@@ -2855,10 +3284,52 @@ impl Drop for Window {
 #[derive(Debug)]
 pub struct RenderContext {
     ptr: *mut ffi::GLFWwindow,
+    glfw: Glfw,
     /// As long as this sender is alive, it is not safe to drop the parent
     /// `Window`.
     #[allow(dead_code)]
     drop_sender: Sender<()>,
+}
+
+impl RenderContext {
+
+    /// Wrapper function, please refer to [`Window::get_proc_address`]
+    pub fn get_proc_address(&mut self, procname: &str) -> GLProc {
+        if self.ptr != unsafe { ffi::glfwGetCurrentContext() } {
+            self.make_current();
+        }
+
+        self.glfw.get_proc_address_raw(procname)
+    }
+
+    /// Wrapper function, please refer to [`Window::get_instance_proc_address`]
+    #[cfg(feature = "vulkan")]
+    pub fn get_instance_proc_address(&mut self, instance: vk::Instance, procname: &str) -> VkProc {
+        self.glfw.get_instance_proc_address_raw(instance, procname)
+    }
+
+    /// Wrapper function, please refer to [`Window::get_physical_device_presentation_support`]
+    #[cfg(feature = "vulkan")]
+    pub fn get_physical_device_presentation_support(
+        &self,
+        instance: vk::Instance,
+        device: vk::PhysicalDevice,
+        queue_family: u32,
+    ) -> bool {
+        self.glfw
+            .get_physical_device_presentation_support_raw(instance, device, queue_family)
+    }
+
+    /// Wrapper function, please refer to [`Window::create_window_surface`]
+    #[cfg(feature = "vulkan")]
+    pub fn create_window_surface(
+        &self,
+        instance: vk::Instance,
+        allocator: *const vk::AllocationCallbacks,
+        surface: *mut vk::SurfaceKHR,
+    ) -> vk::Result {
+        unsafe { ffi::glfwCreateWindowSurface(instance, self.ptr, allocator, surface) }
+    }
 }
 
 unsafe impl Send for RenderContext {}
@@ -3170,10 +3641,6 @@ pub enum JoystickEvent {
     Connected = ffi::CONNECTED,
     Disconnected = ffi::DISCONNECTED,
 }
-
-/// An joystick callback. This can be supplied with some user data to be passed
-/// to the callback function when it is triggered.
-pub type JoystickCallback<UserData> = Callback<fn(JoystickId, JoystickEvent, &UserData), UserData>;
 
 impl Joystick {
     /// Wrapper for `glfwJoystickPresent`.

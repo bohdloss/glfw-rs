@@ -250,7 +250,6 @@ use std::slice;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::ffi::*;
-use std::pin::Pin;
 use std::ptr::{null, null_mut};
 
 #[cfg(feature = "vulkan")]
@@ -1320,7 +1319,7 @@ impl Glfw {
         height: u32,
         title: &str,
         mode: WindowMode<'_>,
-    ) -> Option<(Pin<Box<Window>>, Receiver<(f64, WindowEvent)>)> {
+    ) -> Option<(Box<Window>, Receiver<(f64, WindowEvent)>)> {
         #[cfg(feature = "wayland")]
         {
             // Has to be set otherwise wayland refuses to open window.
@@ -1337,7 +1336,7 @@ impl Glfw {
         title: &str,
         mode: WindowMode<'_>,
         share: Option<&Window>,
-    ) -> Option<(Pin<Box<Window>>, Receiver<(f64, WindowEvent)>)> {
+    ) -> Option<(Box<Window>, Receiver<(f64, WindowEvent)>)> {
         let ptr = unsafe {
             with_c_str(title, |title| {
                 ffi::glfwCreateWindow(
@@ -1357,7 +1356,7 @@ impl Glfw {
         } else {
             let (drop_sender, drop_receiver) = channel();
             let (sender, receiver) = channel();
-            let window = Box::pin(Window {
+            let window = Box::new(Window {
                 ptr,
                 glfw: self.clone(),
                 is_shared: share.is_some(),
@@ -2384,7 +2383,7 @@ impl Window {
         height: u32,
         title: &str,
         mode: WindowMode<'_>,
-    ) -> Option<(Pin<Box<Window>>, Receiver<(f64, WindowEvent)>)> {
+    ) -> Option<(Box<Window>, Receiver<(f64, WindowEvent)>)> {
         self.glfw
             .create_window_intern(width, height, title, mode, Some(self))
     }

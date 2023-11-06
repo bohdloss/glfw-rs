@@ -289,6 +289,7 @@ pub const CONTEXT_RELEASE_BEHAVIOR: c_int = 0x00022009;
 pub const CONTEXT_NO_ERROR: c_int = 0x0002200A;
 pub const CONTEXT_CREATION_API: c_int = 0x0002200B;
 pub const SCALE_TO_MONITOR: c_int = 0x0002200C;
+pub const MOUSE_PASSTHROUGH: c_int = 0x0002000D;
 
 pub const COCOA_RETINA_FRAMEBUFFER: c_int = 0x00023001;
 pub const COCOA_FRAME_NAME: c_int = 0x00023002;

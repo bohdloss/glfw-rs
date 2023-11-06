@@ -1335,6 +1335,9 @@ impl Glfw {
             WindowHint::ScaleToMonitor(scale) => unsafe {
                 ffi::glfwWindowHint(ffi::SCALE_TO_MONITOR, scale as c_int)
             },
+            WindowHint::MousePassthrough(mouse_passthrough) => unsafe {
+                ffi::glfwWindowHint(ffi::MOUSE_PASSTHROUGH, mouse_passthrough as c_int)
+            }
             WindowHint::CocoaRetinaFramebuffer(retina_fb) => unsafe {
                 ffi::glfwWindowHint(ffi::COCOA_RETINA_FRAMEBUFFER, retina_fb as c_int)
             },
@@ -2247,6 +2250,10 @@ pub enum WindowHint {
     ///
     /// This includes the initial placement when the window is created.
     ScaleToMonitor(bool),
+    /// Specifies whether the window is transparent to mouse input, letting any mouse events pass
+    /// through to whatever window is behind it. This is only supported for undecorated windows.
+    /// Decorated windows with this enabled will behave differently between platforms
+    MousePassthrough(bool),
     /// Specifies whether to use full resolution framebuffers on Retina displays.
     ///
     /// This is ignored on platforms besides macOS.
@@ -2785,6 +2792,16 @@ impl Window {
     /// Wrapper for `glfwSetWindowAttrib` called with `DECORATED`.
     pub fn set_decorated(&mut self, decorated: bool) {
         unsafe { ffi::glfwSetWindowAttrib(self.ptr, ffi::DECORATED, decorated as c_int) }
+    }
+
+    /// Wrapper for `glfwSetWindowAttrib` called with `MOUSE_PASSTHROUGH`.
+    pub fn set_mouse_passthrough(&mut self, mouse_passthrough: bool) {
+        unsafe { ffi::glfwSetWindowAttrib(self.ptr, ffi::MOUSE_PASSTHROUGH, mouse_passthrough as c_int) }
+    }
+
+    /// Wrapper for `glfwGetWindowAttrib` called with `MOUSE_PASSTHROUGH`.
+    pub fn get_mouse_passthrough(&self) -> bool {
+        unsafe { ffi::glfwGetWindowAttrib(self.ptr, ffi::MOUSE_PASSTHROUGH) == ffi::TRUE }
     }
 
     /// Wrapper for `glfwGetWindowAttrib` called with `AUTO_ICONIFY`.
